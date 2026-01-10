@@ -4,12 +4,15 @@ use memfd::MemfdOptions;
 use memmap2::MmapMut;
 use pangocairo::functions as pangocairo;
 use shell_words;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::os::unix::io::AsFd;
-use std::time::{Duration, Instant};
-use wayland_client::protocol::{wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_region::WlRegion, wl_registry::WlRegistry, wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface};
-use wayland_client::{globals::{registry_queue_init, GlobalListContents}, Connection, Dispatch, QueueHandle};
+use std::fs::OpenOptions;
+use std::os::unix::io::{AsFd, AsRawFd};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use wayland_client::protocol::{wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_output::WlOutput, wl_region::WlRegion, wl_registry::WlRegistry, wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface};
+use wayland_client::{globals::{registry_queue_init, GlobalListContents}, Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
@@ -50,6 +53,9 @@ struct Config {
     border: [f64; 4],
     edge: i32,
     default_offset: i32,
+    stack_gap: i32,
+    stack: bool,
+    output_scale: i32,
 }
 
 #[derive(Debug)]
@@ -58,11 +64,54 @@ struct Args {
     message: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StackEntry {
+    id: u64,
+    position: String,
+    height: i32,
+    gap: i32,
+    expires_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StackState {
+    next_id: u64,
+    entries: Vec<StackEntry>,
+}
+
+impl Default for StackState {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            entries: Vec::new(),
+        }
+    }
+}
+
+struct StackGuard {
+    id: u64,
+    state_path: String,
+    lock_path: String,
+}
+
+impl Drop for StackGuard {
+    fn drop(&mut self) {
+        if let Ok(_lock) = lock_state(&self.lock_path) {
+            if let Ok(mut state) = load_state(&self.state_path) {
+                state.entries.retain(|entry| entry.id != self.id);
+                let _ = save_state(&self.state_path, &state);
+            }
+        }
+    }
+}
+
 struct State {
     configured: bool,
     closed: bool,
     width: i32,
     height: i32,
+    scale: i32,
+    outputs: HashMap<u32, i32>,
 }
 
 impl Default for State {
@@ -72,6 +121,8 @@ impl Default for State {
             closed: false,
             width: 0,
             height: 0,
+            scale: 1,
+            outputs: HashMap::new(),
         }
     }
 }
@@ -106,13 +157,19 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
 
 impl Dispatch<WlSurface, ()> for State {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &WlSurface,
-        _: wayland_client::protocol::wl_surface::Event,
+        event: wayland_client::protocol::wl_surface::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let wayland_client::protocol::wl_surface::Event::Enter { output } = event {
+            let id = output.id().protocol_id();
+            if let Some(scale) = state.outputs.get(&id) {
+                state.scale = (*scale).max(1);
+            }
+        }
     }
 }
 
@@ -188,6 +245,23 @@ impl Dispatch<WlShmPool, ()> for State {
     }
 }
 
+impl Dispatch<WlOutput, ()> for State {
+    fn event(
+        state: &mut Self,
+        output: &WlOutput,
+        event: wayland_client::protocol::wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_output::Event::Scale { factor } = event {
+            let id = output.id().protocol_id();
+            state.outputs.insert(id, factor);
+            state.scale = factor.max(1);
+        }
+    }
+}
+
 impl Dispatch<WlRegion, ()> for State {
     fn event(
         _: &mut Self,
@@ -201,13 +275,20 @@ impl Dispatch<WlRegion, ()> for State {
 }
 
 fn main() -> Result<()> {
-    let (args, cfg) = parse_args()?;
-
-    let (position, margins) = position_to_anchor(&cfg, args.position);
+    let (args, mut cfg) = parse_args()?;
 
     let (width, height) = measure_text(&cfg, &args.message)?;
     let width = cfg.width.max(width);
     let height = height.max(cfg.padding * 2 + cfg.border_size * 2 + 1);
+
+    let mut state = State {
+        configured: false,
+        closed: false,
+        width,
+        height,
+        scale: cfg.output_scale.max(1),
+        outputs: HashMap::new(),
+    };
 
     let conn = Connection::connect_to_env().context("connect to wayland")?;
     let (globals, mut event_queue) = registry_queue_init(&conn).context("init registry")?;
@@ -229,6 +310,31 @@ fn main() -> Result<()> {
         (),
     );
 
+    event_queue.roundtrip(&mut state)?;
+    if state.scale <= 0 {
+        state.scale = 1;
+    }
+
+    let (position, margins) = position_to_anchor(&cfg, args.position);
+    let mut stack_offset = 0;
+    let mut stack_guard: Option<StackGuard> = None;
+    if cfg.stack && cfg.timeout_ms > 0 {
+        if let Ok((offset, guard)) = reserve_stack_slot(args.position, height, cfg.stack_gap, cfg.timeout_ms) {
+            stack_offset = offset;
+            stack_guard = Some(guard);
+        }
+    }
+
+    let mut margins = margins;
+    match args.position {
+        Position::Bottom | Position::BottomLeft | Position::BottomRight => {
+            margins.bottom += stack_offset;
+        }
+        _ => {
+            margins.top += stack_offset;
+        }
+    }
+
     layer_surface.set_anchor(position);
     layer_surface.set_margin(margins.top, margins.right, margins.bottom, margins.left);
     layer_surface.set_size(width as u32, height as u32);
@@ -237,16 +343,10 @@ fn main() -> Result<()> {
 
     let region = compositor.create_region(&qh, ());
     surface.set_input_region(Some(&region));
+    surface.set_buffer_scale(state.scale);
 
     surface.commit();
     conn.flush()?;
-
-    let mut state = State {
-        configured: false,
-        closed: false,
-        width,
-        height,
-    };
 
     event_queue.roundtrip(&mut state)?;
     if state.width <= 0 || state.height <= 0 {
@@ -254,11 +354,23 @@ fn main() -> Result<()> {
         state.height = height;
     }
 
-    let mut buffer = create_buffer(&shm, &qh, state.width, state.height)?;
-    draw_notification(&mut buffer, state.width, state.height, &cfg, &args.message)?;
+    let pixel_width = state.width * state.scale;
+    let pixel_height = state.height * state.scale;
+    cfg.output_scale = state.scale;
+    surface.set_buffer_scale(state.scale);
+    let mut buffer = create_buffer(&shm, &qh, pixel_width, pixel_height)?;
+    draw_notification(
+        &mut buffer,
+        pixel_width,
+        pixel_height,
+        state.width,
+        state.height,
+        &cfg,
+        &args.message,
+    )?;
 
     surface.attach(Some(&buffer.wl_buffer), 0, 0);
-    surface.damage_buffer(0, 0, state.width, state.height);
+    surface.damage_buffer(0, 0, pixel_width, pixel_height);
     surface.commit();
     conn.flush()?;
 
@@ -269,6 +381,7 @@ fn main() -> Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    drop(stack_guard);
     Ok(())
 }
 
@@ -361,8 +474,17 @@ fn parse_args() -> Result<(Args, Config)> {
             cfg.default_offset = val.parse()?;
         } else if arg.starts_with("--default-offset=") {
             cfg.default_offset = arg.trim_start_matches("--default-offset=").parse()?;
+        } else if arg == "--stack-gap" {
+            let val = next_value("--stack-gap", &mut iter)?;
+            cfg.stack_gap = val.parse()?;
+        } else if arg.starts_with("--stack-gap=") {
+            cfg.stack_gap = arg.trim_start_matches("--stack-gap=").parse()?;
+        } else if arg == "--stack" {
+            cfg.stack = true;
+        } else if arg == "--no-stack" {
+            cfg.stack = false;
         } else if arg == "--help" || arg == "-h" {
-            return Err(anyhow!("usage: creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] <title> [body...]"));
+            return Err(anyhow!("usage: creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] <title> [body...]"));
         } else if arg.starts_with('-') {
             return Err(anyhow!("unknown option: {}", arg));
         } else {
@@ -428,6 +550,9 @@ fn default_config() -> Config {
         border: [1.0, 1.0, 1.0, 1.0],
         edge: 20,
         default_offset: 250,
+        stack_gap: 10,
+        stack: true,
+        output_scale: 1,
     }
 }
 
@@ -537,6 +662,99 @@ fn position_to_anchor(cfg: &Config, position: Position) -> (zwlr_layer_surface_v
     }
 }
 
+fn position_key(position: Position) -> &'static str {
+    match position {
+        Position::TopLeft => "top-left",
+        Position::Top => "top",
+        Position::TopRight => "top-right",
+        Position::Left => "left",
+        Position::Center => "center",
+        Position::Right => "right",
+        Position::BottomLeft => "bottom-left",
+        Position::Bottom => "bottom",
+        Position::BottomRight => "bottom-right",
+        Position::Default => "default",
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as u64
+}
+
+fn state_paths() -> Result<(String, String)> {
+    let xdg_state = env::var("XDG_STATE_HOME")
+        .unwrap_or_else(|_| format!("{}/.local/state", env::var("HOME").unwrap_or_default()));
+    let dir = format!("{}/creak", xdg_state);
+    fs::create_dir_all(&dir)?;
+    Ok((format!("{}/stack.json", dir), format!("{}/stack.lock", dir)))
+}
+
+fn lock_state(lock_path: &str) -> Result<fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(anyhow!("failed to lock stack state"));
+    }
+    Ok(file)
+}
+
+fn load_state(path: &str) -> Result<StackState> {
+    match fs::read_to_string(path) {
+        Ok(data) => serde_json::from_str(&data).context("parse stack state"),
+        Err(_) => Ok(StackState::default()),
+    }
+}
+
+fn save_state(path: &str, state: &StackState) -> Result<()> {
+    let tmp = format!("{}.tmp", path);
+    let data = serde_json::to_vec(state)?;
+    fs::write(&tmp, data)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn reserve_stack_slot(position: Position, height: i32, gap: i32, timeout_ms: u64) -> Result<(i32, StackGuard)> {
+    let (state_path, lock_path) = state_paths()?;
+    let _lock = lock_state(&lock_path)?;
+    let mut state = load_state(&state_path)?;
+    let now = now_millis();
+    state.entries.retain(|entry| entry.expires_at == 0 || entry.expires_at > now);
+
+    let key = position_key(position);
+    let mut offset = 0;
+    for entry in state.entries.iter().filter(|entry| entry.position == key) {
+        offset += entry.height + entry.gap;
+    }
+
+    let id = state.next_id;
+    state.next_id += 1;
+    let expires_at = now.saturating_add(timeout_ms);
+    state.entries.push(StackEntry {
+        id,
+        position: key.to_string(),
+        height,
+        gap,
+        expires_at,
+    });
+    save_state(&state_path, &state)?;
+
+    Ok((
+        offset,
+        StackGuard {
+            id,
+            state_path,
+            lock_path,
+        },
+    ))
+}
+
 fn measure_text(cfg: &Config, text: &str) -> Result<(i32, i32)> {
     let surface = ImageSurface::create(Format::ARgb32, cfg.width.max(1), 1)?;
     let cr = CairoContext::new(&surface)?;
@@ -588,7 +806,15 @@ fn create_buffer(shm: &WlShm, qh: &QueueHandle<State>, width: i32, height: i32) 
     })
 }
 
-fn draw_notification(buffer: &mut Buffer, width: i32, height: i32, cfg: &Config, text: &str) -> Result<()> {
+fn draw_notification(
+    buffer: &mut Buffer,
+    pixel_width: i32,
+    pixel_height: i32,
+    logical_width: i32,
+    logical_height: i32,
+    cfg: &Config,
+    text: &str,
+) -> Result<()> {
     let data = buffer._mmap.as_mut();
     for b in data.iter_mut() {
         *b = 0;
@@ -598,21 +824,23 @@ fn draw_notification(buffer: &mut Buffer, width: i32, height: i32, cfg: &Config,
         ImageSurface::create_for_data_unsafe(
             data.as_mut_ptr(),
             Format::ARgb32,
-            width,
-            height,
+            pixel_width,
+            pixel_height,
             buffer.stride,
         )?
     };
 
     let cr = CairoContext::new(&surface)?;
+    let scale = cfg.output_scale.max(1) as f64;
+    cr.scale(scale, scale);
 
     let radius = cfg.border_radius as f64;
     let border = cfg.border_size as f64;
 
     let x = border / 2.0;
     let y = border / 2.0;
-    let w = width as f64 - border;
-    let h = height as f64 - border;
+    let w = logical_width as f64 - border;
+    let h = logical_height as f64 - border;
 
     rounded_rect(&cr, x, y, w, h, radius);
     cr.set_source_rgba(cfg.background[0], cfg.background[1], cfg.background[2], cfg.background[3]);
@@ -630,7 +858,7 @@ fn draw_notification(buffer: &mut Buffer, width: i32, height: i32, cfg: &Config,
     layout.set_text(text);
     let font_desc = pango::FontDescription::from_string(&cfg.font);
     layout.set_font_description(Some(&font_desc));
-    layout.set_width((width - 2 * (cfg.padding + cfg.border_size)) * pango::SCALE);
+    layout.set_width((logical_width - 2 * (cfg.padding + cfg.border_size)) * pango::SCALE);
     layout.set_alignment(pango::Alignment::Center);
     layout.set_wrap(pango::WrapMode::WordChar);
 

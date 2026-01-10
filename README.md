@@ -13,7 +13,7 @@ Binary output: ./target/release/creak
 ## Usage
 
 ```
-creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] <title> [body...]
+creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] <title> [body...]
 ```
 
 Examples:
@@ -52,8 +52,7 @@ Example config:
 
 # timing
 --timeout 5000
+
+# stacking
+--stack-gap 10
 ```
-
-## Integration
-
-The `alert` wrapper in `/home/oboro/sync/shell/alert` calls `creak`.
