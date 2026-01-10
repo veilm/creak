@@ -399,7 +399,7 @@ fn main() -> Result<()> {
     layer_surface.set_anchor(position);
     layer_surface.set_margin(margins.top, margins.right, margins.bottom, margins.left);
     layer_surface.set_size(width as u32, height as u32);
-    layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
+    layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
     layer_surface.set_exclusive_zone(0);
 
     surface.commit();
