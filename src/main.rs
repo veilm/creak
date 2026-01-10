@@ -3,6 +3,7 @@ use cairo::{Context as CairoContext, Format, ImageSurface};
 use memfd::MemfdOptions;
 use memmap2::MmapMut;
 use pangocairo::functions as pangocairo;
+use shell_words;
 use std::env;
 use std::fs;
 use std::os::unix::io::AsFd;
@@ -47,13 +48,13 @@ struct Config {
     background: [f64; 4],
     text: [f64; 4],
     border: [f64; 4],
+    edge: i32,
+    default_offset: i32,
 }
 
 #[derive(Debug)]
 struct Args {
     position: Position,
-    timeout_ms: Option<u64>,
-    width: Option<i32>,
     message: String,
 }
 
@@ -200,16 +201,9 @@ impl Dispatch<WlRegion, ()> for State {
 }
 
 fn main() -> Result<()> {
-    let args = parse_args()?;
-    let mut cfg = read_config().unwrap_or_else(|_| default_config());
-    if let Some(width) = args.width {
-        cfg.width = width;
-    }
-    if let Some(timeout) = args.timeout_ms {
-        cfg.timeout_ms = timeout;
-    }
+    let (args, cfg) = parse_args()?;
 
-    let (position, margins) = position_to_anchor(args.position);
+    let (position, margins) = position_to_anchor(&cfg, args.position);
 
     let (width, height) = measure_text(&cfg, &args.message)?;
     let width = cfg.width.max(width);
@@ -245,6 +239,7 @@ fn main() -> Result<()> {
     surface.set_input_region(Some(&region));
 
     surface.commit();
+    conn.flush()?;
 
     let mut state = State {
         configured: false,
@@ -265,23 +260,29 @@ fn main() -> Result<()> {
     surface.attach(Some(&buffer.wl_buffer), 0, 0);
     surface.damage_buffer(0, 0, state.width, state.height);
     surface.commit();
+    conn.flush()?;
 
     let deadline = Instant::now() + Duration::from_millis(cfg.timeout_ms);
     while Instant::now() < deadline && !state.closed {
         event_queue.dispatch_pending(&mut state)?;
+        conn.flush()?;
         std::thread::sleep(Duration::from_millis(10));
     }
 
     Ok(())
 }
 
-fn parse_args() -> Result<Args> {
-    let mut position = Position::Default;
-    let mut timeout_ms = None;
-    let mut width = None;
+fn parse_args() -> Result<(Args, Config)> {
+    let mut cfg = default_config();
+    let mut tokens = load_config_args()?;
+    tokens.extend(env::args().skip(1));
+    if env::var("CREAK_DEBUG").is_ok() {
+        eprintln!("creak tokens: {:?}", tokens);
+    }
 
+    let mut position = Position::Default;
     let mut rest: Vec<String> = Vec::new();
-    let mut iter = env::args().skip(1).peekable();
+    let mut iter = tokens.into_iter().peekable();
     while let Some(arg) = iter.next() {
         if arg == "--top-left" {
             position = Position::TopLeft;
@@ -302,23 +303,68 @@ fn parse_args() -> Result<Args> {
         } else if arg == "--bottom-right" {
             position = Position::BottomRight;
         } else if arg == "--timeout" {
-            let val = iter
-                .next()
-                .ok_or_else(|| anyhow!("--timeout requires a value"))?;
-            timeout_ms = Some(val.parse()?);
+            let val = next_value("--timeout", &mut iter)?;
+            cfg.timeout_ms = val.parse()?;
         } else if arg.starts_with("--timeout=") {
             let val = arg.trim_start_matches("--timeout=");
-            timeout_ms = Some(val.parse()?);
+            cfg.timeout_ms = val.parse()?;
         } else if arg == "--width" {
-            let val = iter
-                .next()
-                .ok_or_else(|| anyhow!("--width requires a value"))?;
-            width = Some(val.parse()?);
+            let val = next_value("--width", &mut iter)?;
+            cfg.width = val.parse()?;
         } else if arg.starts_with("--width=") {
             let val = arg.trim_start_matches("--width=");
-            width = Some(val.parse()?);
+            cfg.width = val.parse()?;
+        } else if arg == "--font" {
+            cfg.font = next_value("--font", &mut iter)?;
+        } else if arg.starts_with("--font=") {
+            cfg.font = arg.trim_start_matches("--font=").to_string();
+        } else if arg == "--padding" {
+            let val = next_value("--padding", &mut iter)?;
+            cfg.padding = val.parse()?;
+        } else if arg.starts_with("--padding=") {
+            cfg.padding = arg.trim_start_matches("--padding=").parse()?;
+        } else if arg == "--border-size" {
+            let val = next_value("--border-size", &mut iter)?;
+            cfg.border_size = val.parse()?;
+        } else if arg.starts_with("--border-size=") {
+            cfg.border_size = arg.trim_start_matches("--border-size=").parse()?;
+        } else if arg == "--border-radius" {
+            let val = next_value("--border-radius", &mut iter)?;
+            cfg.border_radius = val.parse()?;
+        } else if arg.starts_with("--border-radius=") {
+            cfg.border_radius = arg.trim_start_matches("--border-radius=").parse()?;
+        } else if arg == "--background" {
+            let val = next_value("--background", &mut iter)?;
+            cfg.background = parse_hex_color(&val).ok_or_else(|| anyhow!("invalid color for --background"))?;
+        } else if arg.starts_with("--background=") {
+            let val = arg.trim_start_matches("--background=");
+            cfg.background = parse_hex_color(val).ok_or_else(|| anyhow!("invalid color for --background"))?;
+        } else if arg == "--text" {
+            let val = next_value("--text", &mut iter)?;
+            cfg.text = parse_hex_color(&val).ok_or_else(|| anyhow!("invalid color for --text"))?;
+        } else if arg.starts_with("--text=") {
+            let val = arg.trim_start_matches("--text=");
+            cfg.text = parse_hex_color(val).ok_or_else(|| anyhow!("invalid color for --text"))?;
+        } else if arg == "--border" {
+            let val = next_value("--border", &mut iter)?;
+            cfg.border = parse_hex_color(&val).ok_or_else(|| anyhow!("invalid color for --border"))?;
+        } else if arg.starts_with("--border=") {
+            let val = arg.trim_start_matches("--border=");
+            cfg.border = parse_hex_color(val).ok_or_else(|| anyhow!("invalid color for --border"))?;
+        } else if arg == "--edge" {
+            let val = next_value("--edge", &mut iter)?;
+            cfg.edge = val.parse()?;
+        } else if arg.starts_with("--edge=") {
+            cfg.edge = arg.trim_start_matches("--edge=").parse()?;
+        } else if arg == "--default-offset" {
+            let val = next_value("--default-offset", &mut iter)?;
+            cfg.default_offset = val.parse()?;
+        } else if arg.starts_with("--default-offset=") {
+            cfg.default_offset = arg.trim_start_matches("--default-offset=").parse()?;
         } else if arg == "--help" || arg == "-h" {
-            return Err(anyhow!("usage: creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] <title> [body...]"));
+            return Err(anyhow!("usage: creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] <title> [body...]"));
+        } else if arg.starts_with('-') {
+            return Err(anyhow!("unknown option: {}", arg));
         } else {
             rest.push(arg);
         }
@@ -336,88 +382,37 @@ fn parse_args() -> Result<Args> {
         format!("{}\n{}", title, body)
     };
 
-    Ok(Args {
-        position,
-        timeout_ms,
-        width,
-        message,
-    })
+    if env::var("CREAK_DEBUG").is_ok() {
+        eprintln!("creak config: {:?}", cfg);
+    }
+    Ok((Args { position, message }, cfg))
 }
 
-fn read_config() -> Result<Config> {
+fn load_config_args() -> Result<Vec<String>> {
     let xdg_config = env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", env::var("HOME").unwrap_or_default()));
-    let mako_main = format!("{}/mako/main", xdg_config);
-    let mako_colours = format!("{}/mako/colours", xdg_config);
+    let path = format!("{}/creak/config", xdg_config);
+    if env::var("CREAK_DEBUG").is_ok() {
+        eprintln!("creak config path: {}", path);
+    }
+    let contents = match fs::read_to_string(&path) {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
+    };
 
-    let main = fs::read_to_string(&mako_main).context("read mako main")?;
-    let colours = fs::read_to_string(&mako_colours).context("read mako colours")?;
-
-    let mut font = "SimSun 25".to_string();
-    let mut width = 350;
-    let mut padding = 10;
-    let mut border_size = 5;
-    let mut border_radius = 10;
-    let mut timeout_ms = 5000;
-
-    let mut in_section = false;
-    for line in main.lines() {
+    let mut args = Vec::new();
+    for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if line.starts_with('[') {
-            in_section = true;
-            continue;
-        }
-        if in_section {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "font" => font = value.to_string(),
-                "width" => width = value.parse().unwrap_or(width),
-                "padding" => padding = parse_first_int(value).unwrap_or(padding),
-                "border-size" => border_size = value.parse().unwrap_or(border_size),
-                "border-radius" => border_radius = parse_first_int(value).unwrap_or(border_radius),
-                "default-timeout" => timeout_ms = value.parse().unwrap_or(timeout_ms),
-                _ => {}
-            }
-        }
+        let parts = shell_words::split(line).context("parse config line")?;
+        args.extend(parts);
     }
+    Ok(args)
+}
 
-    let mut background = [0.1, 0.1, 0.1, 1.0];
-    let mut text = [1.0, 1.0, 1.0, 1.0];
-    let mut border = [1.0, 1.0, 1.0, 1.0];
-
-    for line in colours.lines() {
-        let line = line.trim();
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            if let Some(rgba) = parse_hex_color(value) {
-                match key {
-                    "background-color" => background = rgba,
-                    "text-color" => text = rgba,
-                    "border-color" => border = rgba,
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    Ok(Config {
-        font,
-        width,
-        padding,
-        border_size,
-        border_radius,
-        timeout_ms: timeout_ms as u64,
-        background,
-        text,
-        border,
-    })
+fn next_value(name: &str, iter: &mut std::iter::Peekable<std::vec::IntoIter<String>>) -> Result<String> {
+    iter.next().ok_or_else(|| anyhow!("{} requires a value", name))
 }
 
 fn default_config() -> Config {
@@ -431,6 +426,8 @@ fn default_config() -> Config {
         background: [0.1, 0.1, 0.1, 1.0],
         text: [1.0, 1.0, 1.0, 1.0],
         border: [1.0, 1.0, 1.0, 1.0],
+        edge: 20,
+        default_offset: 250,
     }
 }
 
@@ -461,16 +458,9 @@ fn parse_hex_color(value: &str) -> Option<[f64; 4]> {
     ])
 }
 
-fn parse_first_int(value: &str) -> Option<i32> {
-    value
-        .split(',')
-        .next()
-        .and_then(|v| v.trim().parse().ok())
-}
-
-fn position_to_anchor(position: Position) -> (zwlr_layer_surface_v1::Anchor, Margins) {
-    let edge = 20;
-    let default_offset = 250;
+fn position_to_anchor(cfg: &Config, position: Position) -> (zwlr_layer_surface_v1::Anchor, Margins) {
+    let edge = cfg.edge;
+    let default_offset = cfg.default_offset;
 
     match position {
         Position::TopLeft => (
@@ -652,6 +642,26 @@ fn draw_notification(buffer: &mut Buffer, width: i32, height: i32, cfg: &Config,
     pangocairo::show_layout(&cr, &layout);
 
     surface.flush();
+    if env::var("CREAK_DEBUG").is_ok() {
+        if data.len() >= 4 {
+            eprintln!(
+                "creak pixel0 argb bytes: {:02x} {:02x} {:02x} {:02x}",
+                data[0], data[1], data[2], data[3]
+            );
+        }
+        let px = 10i32;
+        let py = 10i32;
+        let offset = (py * buffer.stride + px * 4) as usize;
+        if data.len() >= offset + 4 {
+            eprintln!(
+                "creak pixel10,10 argb bytes: {:02x} {:02x} {:02x} {:02x}",
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3]
+            );
+        }
+    }
     Ok(())
 }
 

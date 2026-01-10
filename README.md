@@ -31,7 +31,7 @@ creak --background "#00ff00" --text "#000000" "green"
 
 Config file: `$XDG_CONFIG_HOME/creak/config`
 
-The config file is a list of default CLI options (same style as ripgrep). Each line is parsed like shell args; blank lines and `#` comments are ignored.
+The config file is a list of default CLI options (same style as ripgrep). Each line is parsed like shell args; blank lines and lines starting with `#` are ignored.
 
 Example config:
 

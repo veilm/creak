@@ -13,3 +13,4 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 cairo-rs = "0.18"
 pango = "0.18"
 pangocairo = "0.18"
+shell-words = "1"
