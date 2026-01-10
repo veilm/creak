@@ -11,7 +11,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::os::unix::io::{AsFd, AsRawFd};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use wayland_client::protocol::{wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_output::WlOutput, wl_region::WlRegion, wl_registry::WlRegistry, wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface};
+use wayland_client::protocol::{wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_output::WlOutput, wl_pointer::WlPointer, wl_region::WlRegion, wl_registry::WlRegistry, wl_seat::WlSeat, wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface};
 use wayland_client::{globals::{registry_queue_init, GlobalListContents}, Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
@@ -90,6 +90,7 @@ impl Default for StackState {
 
 struct StackGuard {
     id: u64,
+    position: String,
     state_path: String,
     lock_path: String,
 }
@@ -112,6 +113,8 @@ struct State {
     height: i32,
     scale: i32,
     outputs: HashMap<u32, i32>,
+    seat: Option<WlSeat>,
+    pointer: Option<WlPointer>,
 }
 
 impl Default for State {
@@ -123,6 +126,8 @@ impl Default for State {
             height: 0,
             scale: 1,
             outputs: HashMap::new(),
+            seat: None,
+            pointer: None,
         }
     }
 }
@@ -194,6 +199,46 @@ impl Dispatch<WlShm, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &WlSeat,
+        event: wayland_client::protocol::wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_seat::Event::Capabilities { capabilities } = event {
+            if let wayland_client::WEnum::Value(caps) = capabilities {
+                if caps.contains(wayland_client::protocol::wl_seat::Capability::Pointer) {
+                    if state.pointer.is_none() {
+                        state.pointer = Some(seat.get_pointer(qh, ()));
+                    }
+                } else {
+                    state.pointer = None;
+                }
+            }
+        }
+    }
+}
+
+impl Dispatch<WlPointer, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &WlPointer,
+        event: wayland_client::protocol::wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_pointer::Event::Button { state: button_state, .. } = event {
+            if button_state == wayland_client::WEnum::Value(wayland_client::protocol::wl_pointer::ButtonState::Pressed) {
+                state.closed = true;
+            }
+        }
     }
 }
 
@@ -288,6 +333,8 @@ fn main() -> Result<()> {
         height,
         scale: cfg.output_scale.max(1),
         outputs: HashMap::new(),
+        seat: None,
+        pointer: None,
     };
 
     let conn = Connection::connect_to_env().context("connect to wayland")?;
@@ -299,6 +346,7 @@ fn main() -> Result<()> {
     let layer_shell: ZwlrLayerShellV1 = globals
         .bind(&qh, 1..=4, ())
         .context("bind zwlr_layer_shell_v1")?;
+    state.seat = globals.bind(&qh, 1..=7, ()).ok();
 
     let surface = compositor.create_surface(&qh, ());
     let layer_surface = layer_shell.get_layer_surface(
@@ -315,7 +363,7 @@ fn main() -> Result<()> {
         state.scale = 1;
     }
 
-    let (position, margins) = position_to_anchor(&cfg, args.position);
+    let (position, base_margins) = position_to_anchor(&cfg, args.position);
     let mut stack_offset = 0;
     let mut stack_guard: Option<StackGuard> = None;
     if cfg.stack && cfg.timeout_ms > 0 {
@@ -325,25 +373,13 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut margins = margins;
-    match args.position {
-        Position::Bottom | Position::BottomLeft | Position::BottomRight => {
-            margins.bottom += stack_offset;
-        }
-        _ => {
-            margins.top += stack_offset;
-        }
-    }
+    let mut margins = apply_stack_offset(base_margins, args.position, stack_offset);
 
     layer_surface.set_anchor(position);
     layer_surface.set_margin(margins.top, margins.right, margins.bottom, margins.left);
     layer_surface.set_size(width as u32, height as u32);
     layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
     layer_surface.set_exclusive_zone(0);
-
-    let region = compositor.create_region(&qh, ());
-    surface.set_input_region(Some(&region));
-    surface.set_buffer_scale(state.scale);
 
     surface.commit();
     conn.flush()?;
@@ -358,6 +394,9 @@ fn main() -> Result<()> {
     let pixel_height = state.height * state.scale;
     cfg.output_scale = state.scale;
     surface.set_buffer_scale(state.scale);
+    let region = compositor.create_region(&qh, ());
+    region.add(0, 0, state.width, state.height);
+    surface.set_input_region(Some(&region));
     let mut buffer = create_buffer(&shm, &qh, pixel_width, pixel_height)?;
     draw_notification(
         &mut buffer,
@@ -375,9 +414,25 @@ fn main() -> Result<()> {
     conn.flush()?;
 
     let deadline = Instant::now() + Duration::from_millis(cfg.timeout_ms);
+    let mut last_check = Instant::now();
+    let mut last_offset = stack_offset;
     while Instant::now() < deadline && !state.closed {
         event_queue.dispatch_pending(&mut state)?;
         conn.flush()?;
+        if let Some(guard) = stack_guard.as_ref() {
+            if last_check.elapsed() >= Duration::from_millis(100) {
+                if let Ok(offset) = stack_offset_for_id(guard) {
+                    if offset != last_offset {
+                        margins = apply_stack_offset(base_margins, args.position, offset);
+                        layer_surface.set_margin(margins.top, margins.right, margins.bottom, margins.left);
+                        surface.commit();
+                        let _ = conn.flush();
+                        last_offset = offset;
+                    }
+                }
+                last_check = Instant::now();
+            }
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -677,6 +732,18 @@ fn position_key(position: Position) -> &'static str {
     }
 }
 
+fn apply_stack_offset(mut margins: Margins, position: Position, offset: i32) -> Margins {
+    match position {
+        Position::Bottom | Position::BottomLeft | Position::BottomRight => {
+            margins.bottom += offset;
+        }
+        _ => {
+            margins.top += offset;
+        }
+    }
+    margins
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -749,10 +816,27 @@ fn reserve_stack_slot(position: Position, height: i32, gap: i32, timeout_ms: u64
         offset,
         StackGuard {
             id,
+            position: key.to_string(),
             state_path,
             lock_path,
         },
     ))
+}
+
+fn stack_offset_for_id(guard: &StackGuard) -> Result<i32> {
+    let _lock = lock_state(&guard.lock_path)?;
+    let state = load_state(&guard.state_path)?;
+    let mut offset = 0;
+    for entry in state.entries.iter() {
+        if entry.position != guard.position {
+            continue;
+        }
+        if entry.id == guard.id {
+            break;
+        }
+        offset += entry.height + entry.gap;
+    }
+    Ok(offset)
 }
 
 fn measure_text(cfg: &Config, text: &str) -> Result<(i32, i32)> {
