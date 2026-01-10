@@ -1,0 +1,15 @@
+[package]
+name = "creak"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+memfd = "0.6"
+memmap2 = "0.9"
+wayland-client = "0.31"
+wayland-protocols = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+cairo-rs = "0.18"
+pango = "0.18"
+pangocairo = "0.18"
