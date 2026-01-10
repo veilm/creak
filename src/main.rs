@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use cairo::{Context as CairoContext, Format, ImageSurface};
+use cairo::{Antialias, Context as CairoContext, FontOptions, Format, HintMetrics, HintStyle, ImageSurface};
 use memfd::MemfdOptions;
 use memmap2::MmapMut;
 use pangocairo::functions as pangocairo;
@@ -56,6 +56,9 @@ struct Config {
     stack_gap: i32,
     stack: bool,
     output_scale: i32,
+    text_antialias: Option<Antialias>,
+    text_hint: Option<HintStyle>,
+    text_hint_metrics: Option<HintMetrics>,
 }
 
 #[derive(Debug)]
@@ -213,8 +216,14 @@ impl Dispatch<WlSeat, ()> for State {
     ) {
         if let wayland_client::protocol::wl_seat::Event::Capabilities { capabilities } = event {
             if let wayland_client::WEnum::Value(caps) = capabilities {
+                if env::var("CREAK_DEBUG").is_ok() {
+                    eprintln!("creak seat capabilities: {:?}", caps);
+                }
                 if caps.contains(wayland_client::protocol::wl_seat::Capability::Pointer) {
                     if state.pointer.is_none() {
+                        if env::var("CREAK_DEBUG").is_ok() {
+                            eprintln!("creak creating pointer");
+                        }
                         state.pointer = Some(seat.get_pointer(qh, ()));
                     }
                 } else {
@@ -234,10 +243,21 @@ impl Dispatch<WlPointer, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wayland_client::protocol::wl_pointer::Event::Button { state: button_state, .. } = event {
-            if button_state == wayland_client::WEnum::Value(wayland_client::protocol::wl_pointer::ButtonState::Pressed) {
-                state.closed = true;
+        match event {
+            wayland_client::protocol::wl_pointer::Event::Button { state: button_state, .. } => {
+                if button_state == wayland_client::WEnum::Value(wayland_client::protocol::wl_pointer::ButtonState::Pressed) {
+                    if env::var("CREAK_DEBUG").is_ok() {
+                        eprintln!("creak pointer button pressed");
+                    }
+                    state.closed = true;
+                }
             }
+            wayland_client::protocol::wl_pointer::Event::Enter { .. } => {
+                if env::var("CREAK_DEBUG").is_ok() {
+                    eprintln!("creak pointer enter");
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -378,7 +398,7 @@ fn main() -> Result<()> {
     layer_surface.set_anchor(position);
     layer_surface.set_margin(margins.top, margins.right, margins.bottom, margins.left);
     layer_surface.set_size(width as u32, height as u32);
-    layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    layer_surface.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
     layer_surface.set_exclusive_zone(0);
 
     surface.commit();
@@ -390,13 +410,20 @@ fn main() -> Result<()> {
         state.height = height;
     }
 
-    let pixel_width = state.width * state.scale;
-    let pixel_height = state.height * state.scale;
-    cfg.output_scale = state.scale;
+    let _pixel_width = state.width * state.scale;
+    let _pixel_height = state.height * state.scale;
+    if cfg.output_scale <= 0 {
+        cfg.output_scale = state.scale;
+    }
+    let scale = cfg.output_scale.max(1);
+    let pixel_width = state.width * scale;
+    let pixel_height = state.height * scale;
+    state.scale = scale;
     surface.set_buffer_scale(state.scale);
     let region = compositor.create_region(&qh, ());
     region.add(0, 0, state.width, state.height);
     surface.set_input_region(Some(&region));
+
     let mut buffer = create_buffer(&shm, &qh, pixel_width, pixel_height)?;
     draw_notification(
         &mut buffer,
@@ -524,6 +551,29 @@ fn parse_args() -> Result<(Args, Config)> {
             cfg.edge = val.parse()?;
         } else if arg.starts_with("--edge=") {
             cfg.edge = arg.trim_start_matches("--edge=").parse()?;
+        } else if arg == "--scale" {
+            let val = next_value("--scale", &mut iter)?;
+            cfg.output_scale = val.parse()?;
+        } else if arg.starts_with("--scale=") {
+            cfg.output_scale = arg.trim_start_matches("--scale=").parse()?;
+        } else if arg == "--text-antialias" {
+            let val = next_value("--text-antialias", &mut iter)?;
+            cfg.text_antialias = parse_antialias(&val)?;
+        } else if arg.starts_with("--text-antialias=") {
+            let val = arg.trim_start_matches("--text-antialias=");
+            cfg.text_antialias = parse_antialias(val)?;
+        } else if arg == "--text-hint" {
+            let val = next_value("--text-hint", &mut iter)?;
+            cfg.text_hint = parse_hint_style(&val)?;
+        } else if arg.starts_with("--text-hint=") {
+            let val = arg.trim_start_matches("--text-hint=");
+            cfg.text_hint = parse_hint_style(val)?;
+        } else if arg == "--text-hint-metrics" {
+            let val = next_value("--text-hint-metrics", &mut iter)?;
+            cfg.text_hint_metrics = parse_hint_metrics(&val)?;
+        } else if arg.starts_with("--text-hint-metrics=") {
+            let val = arg.trim_start_matches("--text-hint-metrics=");
+            cfg.text_hint_metrics = parse_hint_metrics(val)?;
         } else if arg == "--default-offset" {
             let val = next_value("--default-offset", &mut iter)?;
             cfg.default_offset = val.parse()?;
@@ -539,7 +589,7 @@ fn parse_args() -> Result<(Args, Config)> {
         } else if arg == "--no-stack" {
             cfg.stack = false;
         } else if arg == "--help" || arg == "-h" {
-            return Err(anyhow!("usage: creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] <title> [body...]"));
+            return Err(anyhow!("usage: creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] [--scale n] [--text-antialias default|none|gray|subpixel] [--text-hint default|none|slight|medium|full] [--text-hint-metrics default|on|off] <title> [body...]"));
         } else if arg.starts_with('-') {
             return Err(anyhow!("unknown option: {}", arg));
         } else {
@@ -607,7 +657,10 @@ fn default_config() -> Config {
         default_offset: 250,
         stack_gap: 10,
         stack: true,
-        output_scale: 1,
+        output_scale: 0,
+        text_antialias: None,
+        text_hint: None,
+        text_hint_metrics: None,
     }
 }
 
@@ -636,6 +689,36 @@ fn parse_hex_color(value: &str) -> Option<[f64; 4]> {
         b as f64 / 255.0,
         a as f64 / 255.0,
     ])
+}
+
+fn parse_antialias(value: &str) -> Result<Option<Antialias>> {
+    match value {
+        "default" => Ok(None),
+        "none" => Ok(Some(Antialias::None)),
+        "gray" => Ok(Some(Antialias::Gray)),
+        "subpixel" => Ok(Some(Antialias::Subpixel)),
+        _ => Err(anyhow!("invalid --text-antialias: {}", value)),
+    }
+}
+
+fn parse_hint_style(value: &str) -> Result<Option<HintStyle>> {
+    match value {
+        "default" => Ok(None),
+        "none" => Ok(Some(HintStyle::None)),
+        "slight" => Ok(Some(HintStyle::Slight)),
+        "medium" => Ok(Some(HintStyle::Medium)),
+        "full" => Ok(Some(HintStyle::Full)),
+        _ => Err(anyhow!("invalid --text-hint: {}", value)),
+    }
+}
+
+fn parse_hint_metrics(value: &str) -> Result<Option<HintMetrics>> {
+    match value {
+        "default" => Ok(None),
+        "on" => Ok(Some(HintMetrics::On)),
+        "off" => Ok(Some(HintMetrics::Off)),
+        _ => Err(anyhow!("invalid --text-hint-metrics: {}", value)),
+    }
 }
 
 fn position_to_anchor(cfg: &Config, position: Position) -> (zwlr_layer_surface_v1::Anchor, Margins) {
@@ -945,6 +1028,23 @@ fn draw_notification(
     layout.set_width((logical_width - 2 * (cfg.padding + cfg.border_size)) * pango::SCALE);
     layout.set_alignment(pango::Alignment::Center);
     layout.set_wrap(pango::WrapMode::WordChar);
+
+    if cfg.text_antialias.is_some() || cfg.text_hint.is_some() || cfg.text_hint_metrics.is_some() {
+        if let Ok(mut opts) = FontOptions::new() {
+            if let Some(aa) = cfg.text_antialias {
+                opts.set_antialias(aa);
+            }
+            if let Some(hint) = cfg.text_hint {
+                opts.set_hint_style(hint);
+            }
+            if let Some(metrics) = cfg.text_hint_metrics {
+                opts.set_hint_metrics(metrics);
+            }
+            cr.set_font_options(&opts);
+            let context = layout.context();
+            pangocairo::context_set_font_options(&context, Some(&opts));
+        }
+    }
 
     cr.set_source_rgba(cfg.text[0], cfg.text[1], cfg.text[2], cfg.text[3]);
     cr.move_to(
