@@ -10,9 +10,10 @@ use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::os::unix::io::{AsFd, AsRawFd};
+use std::io::ErrorKind;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wayland_client::protocol::{wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_output::WlOutput, wl_pointer::WlPointer, wl_region::WlRegion, wl_registry::WlRegistry, wl_seat::WlSeat, wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface};
-use wayland_client::{globals::{registry_queue_init, GlobalListContents}, Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::{backend::WaylandError, globals::{registry_queue_init, GlobalListContents}, Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
@@ -444,7 +445,7 @@ fn main() -> Result<()> {
     let mut last_check = Instant::now();
     let mut last_offset = stack_offset;
     while Instant::now() < deadline && !state.closed {
-        event_queue.dispatch_pending(&mut state)?;
+        dispatch_with_timeout(&mut event_queue, &mut state, 10)?;
         conn.flush()?;
         if let Some(guard) = stack_guard.as_ref() {
             if last_check.elapsed() >= Duration::from_millis(100) {
@@ -460,7 +461,6 @@ fn main() -> Result<()> {
                 last_check = Instant::now();
             }
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
 
     drop(stack_guard);
@@ -613,6 +613,32 @@ fn parse_args() -> Result<(Args, Config)> {
         eprintln!("creak config: {:?}", cfg);
     }
     Ok((Args { position, message }, cfg))
+}
+
+fn dispatch_with_timeout(
+    event_queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    timeout_ms: i32,
+) -> Result<()> {
+    if let Some(guard) = event_queue.prepare_read() {
+        let fd = guard.connection_fd().as_raw_fd();
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pollfd as *mut libc::pollfd, 1, timeout_ms) };
+        if rc > 0 && (pollfd.revents & libc::POLLIN) != 0 {
+            if let Err(err) = guard.read() {
+                match err {
+                    WaylandError::Io(io_err) if io_err.kind() == ErrorKind::WouldBlock => {}
+                    other => return Err(anyhow!("wayland read error: {:?}", other)),
+                }
+            }
+        }
+    }
+    event_queue.dispatch_pending(state)?;
+    Ok(())
 }
 
 fn load_config_args() -> Result<Vec<String>> {
