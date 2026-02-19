@@ -13,7 +13,11 @@ Binary output: ./target/release/creak
 ## Usage
 
 ```
-creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] [--scale n] [--text-antialias default|none|gray|subpixel] [--text-hint default|none|slight|medium|full] [--text-hint-metrics default|on|off] <title> [body...]
+creak list active [--state-dir path]
+creak clear by name <name> [--state-dir path]
+creak clear by class <class> [--state-dir path]
+creak clear by id <id> [--state-dir path]
+creak [--state-dir path] [--name id] [--class class] [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] [--scale n] [--text-antialias default|none|gray|subpixel] [--text-hint default|none|slight|medium|full] [--text-hint-metrics default|on|off] <title> [body...]
 ```
 
 Examples:
@@ -25,6 +29,9 @@ creak --bottom "done"
 creak --timeout 2000 "short"
 creak --width 420 "wide"
 creak --background "#00ff00" --text "#000000" "green"
+creak --name water --class reminder "drink water"
+creak list active
+creak clear by name water
 ```
 
 ## Config
