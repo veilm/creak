@@ -83,6 +83,7 @@ struct AlertArgs {
 
 #[derive(Debug)]
 enum Command {
+    Help,
     Show(AlertArgs),
     ListActive,
     ClearByName(String),
@@ -144,6 +145,48 @@ struct StackGuard {
 }
 
 static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
+const HELP_TEXT: &str = r#"creak
+
+Usage:
+  creak list active [--style <name|path>] [--state-dir <path>]
+  creak clear by name <name> [--style <name|path>] [--state-dir <path>]
+  creak clear by class <class> [--style <name|path>] [--state-dir <path>]
+  creak clear by id <id> [--style <name|path>] [--state-dir <path>]
+  creak [--style <name|path>] [--state-dir <path>] [--name <name>] [--class <class>] [options] <title> [body...]
+
+Alert options:
+  --top-left | --top | --top-right
+  --left | --center | --right
+  --bottom-left | --bottom | --bottom-right
+  --timeout <ms>
+  --width <px>
+  --font <font>
+  --padding <px>
+  --border-size <px>
+  --border-radius <px>
+  --background <#RRGGBB[AA]>
+  --text <#RRGGBB[AA]>
+  --border <#RRGGBB[AA]>
+  --edge <px>
+  --default-offset <px>
+  --stack-gap <px>
+  --stack | --no-stack
+  --scale <n>
+  --text-antialias default|none|gray|subpixel
+  --text-hint default|none|slight|medium|full
+  --text-hint-metrics default|on|off
+
+Control commands:
+  list active                Print active alerts as JSON
+  clear by name <name>       SIGTERM + remove matching alerts
+  clear by class <class>     SIGTERM + remove matching alerts
+  clear by id <id>           SIGTERM + remove matching alert
+
+Common:
+  --style <name|path>        Config file: name in $XDG_CONFIG_HOME/creak or file path
+  --state-dir <path>         Use a custom state directory
+  --help, -h                 Show this help
+"#;
 
 impl Drop for StackGuard {
     fn drop(&mut self) {
@@ -399,8 +442,13 @@ impl Dispatch<WlRegion, ()> for State {
 
 fn main() -> Result<()> {
     let (args, mut cfg) = parse_args()?;
+    if matches!(args.command, Command::Help) {
+        println!("{}", HELP_TEXT);
+        return Ok(());
+    }
     let state_paths = state_paths(args.state_dir.as_deref())?;
     match args.command {
+        Command::Help => return Ok(()),
         Command::ListActive => {
             let entries = list_active_entries(&state_paths)?;
             println!("{}", serde_json::to_string_pretty(&entries)?);
@@ -581,12 +629,39 @@ fn install_signal_handlers() {
 
 fn parse_args() -> Result<(Args, Config)> {
     let cfg = default_config();
-    let mut tokens = load_config_args()?;
-    tokens.extend(env::args().skip(1));
+    let cli_tokens: Vec<String> = env::args().skip(1).collect();
+    let (style, mut cli_tokens) = extract_style_arg(cli_tokens)?;
+    let mut tokens = load_config_args(style.as_deref())?;
+    tokens.append(&mut cli_tokens);
     if env::var("CREAK_DEBUG").is_ok() {
         eprintln!("creak tokens: {:?}", tokens);
     }
     parse_tokens(tokens, cfg)
+}
+
+fn extract_style_arg(tokens: Vec<String>) -> Result<(Option<String>, Vec<String>)> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut style: Option<String> = None;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let arg = &tokens[i];
+        if arg == "--style" {
+            if i + 1 >= tokens.len() {
+                return Err(anyhow!("--style requires a value"));
+            }
+            style = Some(tokens[i + 1].clone());
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--style=") {
+            style = Some(value.to_string());
+            i += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    Ok((style, out))
 }
 
 fn parse_tokens(tokens: Vec<String>, mut cfg: Config) -> Result<(Args, Config)> {
@@ -754,7 +829,7 @@ fn parse_tokens(tokens: Vec<String>, mut cfg: Config) -> Result<(Args, Config)> 
         } else if arg == "clear" {
             command = Some(parse_clear_command(&mut iter)?);
         } else if arg == "--help" || arg == "-h" {
-            return Err(anyhow!("usage: creak [list active|clear by name <name>|clear by class <class>|clear by id <id>] [--state-dir path] OR creak [--name id] [--class class] [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] [--scale n] [--text-antialias default|none|gray|subpixel] [--text-hint default|none|slight|medium|full] [--text-hint-metrics default|on|off] <title> [body...]"));
+            command = Some(Command::Help);
         } else if arg.starts_with('-') {
             return Err(anyhow!("unknown option: {}", arg));
         } else {
@@ -837,10 +912,10 @@ fn dispatch_with_timeout(
     Ok(())
 }
 
-fn load_config_args() -> Result<Vec<String>> {
+fn load_config_args(style: Option<&str>) -> Result<Vec<String>> {
     let xdg_config = env::var("XDG_CONFIG_HOME")
         .unwrap_or_else(|_| format!("{}/.config", env::var("HOME").unwrap_or_default()));
-    let path = format!("{}/creak/config", xdg_config);
+    let path = config_path_for_style(&xdg_config, style);
     if env::var("CREAK_DEBUG").is_ok() {
         eprintln!("creak config path: {}", path);
     }
@@ -859,6 +934,15 @@ fn load_config_args() -> Result<Vec<String>> {
         args.extend(parts);
     }
     Ok(args)
+}
+
+fn config_path_for_style(xdg_config_home: &str, style: Option<&str>) -> String {
+    let default_dir = format!("{}/creak", xdg_config_home);
+    match style {
+        Some(value) if value.contains('/') => value.to_string(),
+        Some(value) => format!("{}/{}", default_dir, value),
+        None => format!("{}/config", default_dir),
+    }
 }
 
 fn next_value(
@@ -1509,6 +1593,37 @@ mod tests {
             _ => panic!("expected list active command"),
         }
         assert_eq!(args.state_dir.as_deref(), Some("/tmp/creak-test"));
+    }
+
+    #[test]
+    fn extract_style_arg_splits_cli_tokens() {
+        let tokens = vec![
+            "--style".to_string(),
+            "hi".to_string(),
+            "--timeout".to_string(),
+            "10".to_string(),
+            "hello".to_string(),
+        ];
+        let (style, rest) = extract_style_arg(tokens).expect("extract style");
+        assert_eq!(style.as_deref(), Some("hi"));
+        assert_eq!(rest, vec!["--timeout", "10", "hello"]);
+    }
+
+    #[test]
+    fn config_path_for_style_resolves_name_and_path() {
+        let xdg = "/tmp/xdg";
+        assert_eq!(
+            config_path_for_style(xdg, None),
+            "/tmp/xdg/creak/config".to_string()
+        );
+        assert_eq!(
+            config_path_for_style(xdg, Some("hi")),
+            "/tmp/xdg/creak/hi".to_string()
+        );
+        assert_eq!(
+            config_path_for_style(xdg, Some("/tmp/custom-style")),
+            "/tmp/custom-style".to_string()
+        );
     }
 
     #[test]
