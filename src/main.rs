@@ -883,7 +883,20 @@ fn lock_state(lock_path: &str) -> Result<fs::File> {
 
 fn load_state(path: &str) -> Result<StackState> {
     match fs::read_to_string(path) {
-        Ok(data) => serde_json::from_str(&data).context("parse stack state"),
+        Ok(data) => {
+            if data.trim().is_empty() {
+                return Ok(StackState::default());
+            }
+            match serde_json::from_str(&data) {
+                Ok(state) => Ok(state),
+                Err(err) => {
+                    if env::var("CREAK_DEBUG").is_ok() {
+                        eprintln!("creak stack state parse failed: {}", err);
+                    }
+                    Ok(StackState::default())
+                }
+            }
+        }
         Err(_) => Ok(StackState::default()),
     }
 }
