@@ -1,19 +1,30 @@
 use anyhow::{anyhow, Context, Result};
-use cairo::{Antialias, Context as CairoContext, FontOptions, Format, HintMetrics, HintStyle, ImageSurface};
+use cairo::{
+    Antialias, Context as CairoContext, FontOptions, Format, HintMetrics, HintStyle, ImageSurface,
+};
 use memfd::MemfdOptions;
 use memmap2::MmapMut;
 use pangocairo::functions as pangocairo;
-use shell_words;
 use serde::{Deserialize, Serialize};
+use shell_words;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
-use std::os::unix::io::{AsFd, AsRawFd};
 use std::io::ErrorKind;
+use std::os::unix::io::{AsFd, AsRawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use wayland_client::protocol::{wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_output::WlOutput, wl_pointer::WlPointer, wl_region::WlRegion, wl_registry::WlRegistry, wl_seat::WlSeat, wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface};
-use wayland_client::{backend::WaylandError, globals::{registry_queue_init, GlobalListContents}, Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::protocol::{
+    wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_output::WlOutput, wl_pointer::WlPointer,
+    wl_region::WlRegion, wl_registry::WlRegistry, wl_seat::WlSeat, wl_shm::WlShm,
+    wl_shm_pool::WlShmPool, wl_surface::WlSurface,
+};
+use wayland_client::{
+    backend::WaylandError,
+    globals::{registry_queue_init, GlobalListContents},
+    Connection, Dispatch, Proxy, QueueHandle,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
@@ -63,9 +74,32 @@ struct Config {
 }
 
 #[derive(Debug)]
-struct Args {
+struct AlertArgs {
     position: Position,
     message: String,
+    name: Option<String>,
+    class: Option<String>,
+}
+
+#[derive(Debug)]
+enum Command {
+    Show(AlertArgs),
+    ListActive,
+    ClearByName(String),
+    ClearByClass(String),
+    ClearById(u64),
+}
+
+#[derive(Debug)]
+struct Args {
+    command: Command,
+    state_dir: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StatePaths {
+    state_path: String,
+    lock_path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +109,16 @@ struct StackEntry {
     height: i32,
     gap: i32,
     expires_at: u64,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default)]
+    pid: u32,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    class: Option<String>,
+    #[serde(default)]
+    summary: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -98,6 +142,8 @@ struct StackGuard {
     state_path: String,
     lock_path: String,
 }
+
+static SHOULD_CLOSE: AtomicBool = AtomicBool::new(false);
 
 impl Drop for StackGuard {
     fn drop(&mut self) {
@@ -146,7 +192,11 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+            zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                width,
+                height,
+            } => {
                 proxy.ack_configure(serial);
                 state.configured = true;
                 if width > 0 {
@@ -245,8 +295,15 @@ impl Dispatch<WlPointer, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            wayland_client::protocol::wl_pointer::Event::Button { state: button_state, .. } => {
-                if button_state == wayland_client::WEnum::Value(wayland_client::protocol::wl_pointer::ButtonState::Pressed) {
+            wayland_client::protocol::wl_pointer::Event::Button {
+                state: button_state,
+                ..
+            } => {
+                if button_state
+                    == wayland_client::WEnum::Value(
+                        wayland_client::protocol::wl_pointer::ButtonState::Pressed,
+                    )
+                {
                     if env::var("CREAK_DEBUG").is_ok() {
                         eprintln!("creak pointer button pressed");
                     }
@@ -342,8 +399,40 @@ impl Dispatch<WlRegion, ()> for State {
 
 fn main() -> Result<()> {
     let (args, mut cfg) = parse_args()?;
+    let state_paths = state_paths(args.state_dir.as_deref())?;
+    match args.command {
+        Command::ListActive => {
+            let entries = list_active_entries(&state_paths)?;
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+            return Ok(());
+        }
+        Command::ClearByName(name) => {
+            let count = clear_active_entries(&state_paths, ClearSelector::Name(name))?;
+            println!("{}", count);
+            return Ok(());
+        }
+        Command::ClearByClass(class) => {
+            let count = clear_active_entries(&state_paths, ClearSelector::Class(class))?;
+            println!("{}", count);
+            return Ok(());
+        }
+        Command::ClearById(id) => {
+            let count = clear_active_entries(&state_paths, ClearSelector::Id(id))?;
+            println!("{}", count);
+            return Ok(());
+        }
+        Command::Show(alert) => {
+            run_alert(alert, &mut cfg, &state_paths)?;
+        }
+    }
+    Ok(())
+}
 
-    let (width, height) = measure_text(&cfg, &args.message)?;
+fn run_alert(args: AlertArgs, cfg: &mut Config, state_paths: &StatePaths) -> Result<()> {
+    install_signal_handlers();
+    SHOULD_CLOSE.store(false, Ordering::Relaxed);
+
+    let (width, height) = measure_text(cfg, &args.message)?;
     let width = cfg.width.max(width);
     let height = height.max(cfg.padding * 2 + cfg.border_size * 2 + 1);
 
@@ -384,11 +473,20 @@ fn main() -> Result<()> {
         state.scale = 1;
     }
 
-    let (position, base_margins) = position_to_anchor(&cfg, args.position);
+    let (position, base_margins) = position_to_anchor(cfg, args.position);
     let mut stack_offset = 0;
     let mut stack_guard: Option<StackGuard> = None;
     if cfg.stack && cfg.timeout_ms > 0 {
-        if let Ok((offset, guard)) = reserve_stack_slot(args.position, height, cfg.stack_gap, cfg.timeout_ms) {
+        if let Ok((offset, guard)) = reserve_stack_slot(
+            state_paths,
+            args.position,
+            height,
+            cfg.stack_gap,
+            cfg.timeout_ms,
+            args.name.clone(),
+            args.class.clone(),
+            message_summary(&args.message),
+        ) {
             stack_offset = offset;
             stack_guard = Some(guard);
         }
@@ -411,8 +509,6 @@ fn main() -> Result<()> {
         state.height = height;
     }
 
-    let _pixel_width = state.width * state.scale;
-    let _pixel_height = state.height * state.scale;
     if cfg.output_scale <= 0 {
         cfg.output_scale = state.scale;
     }
@@ -432,7 +528,7 @@ fn main() -> Result<()> {
         pixel_height,
         state.width,
         state.height,
-        &cfg,
+        cfg,
         &args.message,
     )?;
 
@@ -444,7 +540,7 @@ fn main() -> Result<()> {
     let deadline = Instant::now() + Duration::from_millis(cfg.timeout_ms);
     let mut last_check = Instant::now();
     let mut last_offset = stack_offset;
-    while Instant::now() < deadline && !state.closed {
+    while Instant::now() < deadline && !state.closed && !SHOULD_CLOSE.load(Ordering::Relaxed) {
         dispatch_with_timeout(&mut event_queue, &mut state, 10)?;
         conn.flush()?;
         if let Some(guard) = stack_guard.as_ref() {
@@ -452,7 +548,12 @@ fn main() -> Result<()> {
                 if let Ok(offset) = stack_offset_for_id(guard) {
                     if offset != last_offset {
                         margins = apply_stack_offset(base_margins, args.position, offset);
-                        layer_surface.set_margin(margins.top, margins.right, margins.bottom, margins.left);
+                        layer_surface.set_margin(
+                            margins.top,
+                            margins.right,
+                            margins.bottom,
+                            margins.left,
+                        );
                         surface.commit();
                         let _ = conn.flush();
                         last_offset = offset;
@@ -467,15 +568,33 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+unsafe extern "C" fn handle_signal(_: i32) {
+    SHOULD_CLOSE.store(true, Ordering::Relaxed);
+}
+
+fn install_signal_handlers() {
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
+    }
+}
+
 fn parse_args() -> Result<(Args, Config)> {
-    let mut cfg = default_config();
+    let cfg = default_config();
     let mut tokens = load_config_args()?;
     tokens.extend(env::args().skip(1));
     if env::var("CREAK_DEBUG").is_ok() {
         eprintln!("creak tokens: {:?}", tokens);
     }
+    parse_tokens(tokens, cfg)
+}
 
+fn parse_tokens(tokens: Vec<String>, mut cfg: Config) -> Result<(Args, Config)> {
     let mut position = Position::Default;
+    let mut alert_name: Option<String> = None;
+    let mut alert_class: Option<String> = None;
+    let mut state_dir: Option<String> = None;
+    let mut command: Option<Command> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut iter = tokens.into_iter().peekable();
     while let Some(arg) = iter.next() {
@@ -530,10 +649,12 @@ fn parse_args() -> Result<(Args, Config)> {
             cfg.border_radius = arg.trim_start_matches("--border-radius=").parse()?;
         } else if arg == "--background" {
             let val = next_value("--background", &mut iter)?;
-            cfg.background = parse_hex_color(&val).ok_or_else(|| anyhow!("invalid color for --background"))?;
+            cfg.background =
+                parse_hex_color(&val).ok_or_else(|| anyhow!("invalid color for --background"))?;
         } else if arg.starts_with("--background=") {
             let val = arg.trim_start_matches("--background=");
-            cfg.background = parse_hex_color(val).ok_or_else(|| anyhow!("invalid color for --background"))?;
+            cfg.background =
+                parse_hex_color(val).ok_or_else(|| anyhow!("invalid color for --background"))?;
         } else if arg == "--text" {
             let val = next_value("--text", &mut iter)?;
             cfg.text = parse_hex_color(&val).ok_or_else(|| anyhow!("invalid color for --text"))?;
@@ -542,10 +663,12 @@ fn parse_args() -> Result<(Args, Config)> {
             cfg.text = parse_hex_color(val).ok_or_else(|| anyhow!("invalid color for --text"))?;
         } else if arg == "--border" {
             let val = next_value("--border", &mut iter)?;
-            cfg.border = parse_hex_color(&val).ok_or_else(|| anyhow!("invalid color for --border"))?;
+            cfg.border =
+                parse_hex_color(&val).ok_or_else(|| anyhow!("invalid color for --border"))?;
         } else if arg.starts_with("--border=") {
             let val = arg.trim_start_matches("--border=");
-            cfg.border = parse_hex_color(val).ok_or_else(|| anyhow!("invalid color for --border"))?;
+            cfg.border =
+                parse_hex_color(val).ok_or_else(|| anyhow!("invalid color for --border"))?;
         } else if arg == "--edge" {
             let val = next_value("--edge", &mut iter)?;
             cfg.edge = val.parse()?;
@@ -588,8 +711,50 @@ fn parse_args() -> Result<(Args, Config)> {
             cfg.stack = true;
         } else if arg == "--no-stack" {
             cfg.stack = false;
+        } else if arg == "--name" {
+            alert_name = Some(next_value("--name", &mut iter)?);
+        } else if arg.starts_with("--name=") {
+            alert_name = Some(arg.trim_start_matches("--name=").to_string());
+        } else if arg == "--class" {
+            alert_class = Some(next_value("--class", &mut iter)?);
+        } else if arg.starts_with("--class=") {
+            alert_class = Some(arg.trim_start_matches("--class=").to_string());
+        } else if arg == "--state-dir" {
+            state_dir = Some(next_value("--state-dir", &mut iter)?);
+        } else if arg.starts_with("--state-dir=") {
+            state_dir = Some(arg.trim_start_matches("--state-dir=").to_string());
+        } else if arg == "--list-active" {
+            command = Some(Command::ListActive);
+        } else if arg == "--clear-by-name" {
+            let name = next_value("--clear-by-name", &mut iter)?;
+            command = Some(Command::ClearByName(name));
+        } else if arg.starts_with("--clear-by-name=") {
+            command = Some(Command::ClearByName(
+                arg.trim_start_matches("--clear-by-name=").to_string(),
+            ));
+        } else if arg == "--clear-by-class" {
+            let class = next_value("--clear-by-class", &mut iter)?;
+            command = Some(Command::ClearByClass(class));
+        } else if arg.starts_with("--clear-by-class=") {
+            command = Some(Command::ClearByClass(
+                arg.trim_start_matches("--clear-by-class=").to_string(),
+            ));
+        } else if arg == "--clear-by-id" {
+            let id = next_value("--clear-by-id", &mut iter)?;
+            command = Some(Command::ClearById(id.parse()?));
+        } else if arg.starts_with("--clear-by-id=") {
+            let id = arg.trim_start_matches("--clear-by-id=");
+            command = Some(Command::ClearById(id.parse()?));
+        } else if arg == "list" {
+            let sub = next_value("list", &mut iter)?;
+            if sub != "active" {
+                return Err(anyhow!("usage: creak list active"));
+            }
+            command = Some(Command::ListActive);
+        } else if arg == "clear" {
+            command = Some(parse_clear_command(&mut iter)?);
         } else if arg == "--help" || arg == "-h" {
-            return Err(anyhow!("usage: creak [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] [--scale n] [--text-antialias default|none|gray|subpixel] [--text-hint default|none|slight|medium|full] [--text-hint-metrics default|on|off] <title> [body...]"));
+            return Err(anyhow!("usage: creak [list active|clear by name <name>|clear by class <class>|clear by id <id>] [--state-dir path] OR creak [--name id] [--class class] [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] [--scale n] [--text-antialias default|none|gray|subpixel] [--text-hint default|none|slight|medium|full] [--text-hint-metrics default|on|off] <title> [body...]"));
         } else if arg.starts_with('-') {
             return Err(anyhow!("unknown option: {}", arg));
         } else {
@@ -597,22 +762,53 @@ fn parse_args() -> Result<(Args, Config)> {
         }
     }
 
-    if rest.is_empty() {
-        return Err(anyhow!("missing message"));
-    }
-
-    let message = if rest.len() == 1 {
-        rest[0].clone()
+    let command = if let Some(command) = command {
+        if !rest.is_empty() {
+            return Err(anyhow!(
+                "unexpected positional arguments for control command"
+            ));
+        }
+        command
     } else {
-        let title = &rest[0];
-        let body = rest[1..].join(" ");
-        format!("{}\n{}", title, body)
+        if rest.is_empty() {
+            return Err(anyhow!("missing message"));
+        }
+        let message = if rest.len() == 1 {
+            rest[0].clone()
+        } else {
+            let title = &rest[0];
+            let body = rest[1..].join(" ");
+            format!("{}\n{}", title, body)
+        };
+        Command::Show(AlertArgs {
+            position,
+            message,
+            name: alert_name,
+            class: alert_class,
+        })
     };
 
     if env::var("CREAK_DEBUG").is_ok() {
         eprintln!("creak config: {:?}", cfg);
     }
-    Ok((Args { position, message }, cfg))
+    Ok((Args { command, state_dir }, cfg))
+}
+
+fn parse_clear_command(
+    iter: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+) -> Result<Command> {
+    let by = next_value("clear", iter)?;
+    if by != "by" {
+        return Err(anyhow!("usage: creak clear by <name|class|id> <value>"));
+    }
+    let key = next_value("clear by", iter)?;
+    let value = next_value("clear by <key>", iter)?;
+    match key.as_str() {
+        "name" => Ok(Command::ClearByName(value)),
+        "class" => Ok(Command::ClearByClass(value)),
+        "id" => Ok(Command::ClearById(value.parse()?)),
+        _ => Err(anyhow!("usage: creak clear by <name|class|id> <value>")),
+    }
 }
 
 fn dispatch_with_timeout(
@@ -642,7 +838,8 @@ fn dispatch_with_timeout(
 }
 
 fn load_config_args() -> Result<Vec<String>> {
-    let xdg_config = env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{}/.config", env::var("HOME").unwrap_or_default()));
+    let xdg_config = env::var("XDG_CONFIG_HOME")
+        .unwrap_or_else(|_| format!("{}/.config", env::var("HOME").unwrap_or_default()));
     let path = format!("{}/creak/config", xdg_config);
     if env::var("CREAK_DEBUG").is_ok() {
         eprintln!("creak config path: {}", path);
@@ -664,8 +861,12 @@ fn load_config_args() -> Result<Vec<String>> {
     Ok(args)
 }
 
-fn next_value(name: &str, iter: &mut std::iter::Peekable<std::vec::IntoIter<String>>) -> Result<String> {
-    iter.next().ok_or_else(|| anyhow!("{} requires a value", name))
+fn next_value(
+    name: &str,
+    iter: &mut std::iter::Peekable<std::vec::IntoIter<String>>,
+) -> Result<String> {
+    iter.next()
+        .ok_or_else(|| anyhow!("{} requires a value", name))
 }
 
 fn default_config() -> Config {
@@ -747,7 +948,10 @@ fn parse_hint_metrics(value: &str) -> Result<Option<HintMetrics>> {
     }
 }
 
-fn position_to_anchor(cfg: &Config, position: Position) -> (zwlr_layer_surface_v1::Anchor, Margins) {
+fn position_to_anchor(
+    cfg: &Config,
+    position: Position,
+) -> (zwlr_layer_surface_v1::Anchor, Margins) {
     let edge = cfg.edge;
     let default_offset = cfg.default_offset;
 
@@ -782,10 +986,7 @@ fn position_to_anchor(cfg: &Config, position: Position) -> (zwlr_layer_surface_v
                 ..Margins::default()
             },
         ),
-        Position::Center => (
-            zwlr_layer_surface_v1::Anchor::empty(),
-            Margins::default(),
-        ),
+        Position::Center => (zwlr_layer_surface_v1::Anchor::empty(), Margins::default()),
         Position::Right => (
             zwlr_layer_surface_v1::Anchor::Right,
             Margins {
@@ -860,12 +1061,21 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn state_paths() -> Result<(String, String)> {
-    let xdg_state = env::var("XDG_STATE_HOME")
-        .unwrap_or_else(|_| format!("{}/.local/state", env::var("HOME").unwrap_or_default()));
-    let dir = format!("{}/creak", xdg_state);
+fn state_paths(state_dir: Option<&str>) -> Result<StatePaths> {
+    let dir = match state_dir {
+        Some(dir) => dir.to_string(),
+        None => {
+            let xdg_state = env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
+                format!("{}/.local/state", env::var("HOME").unwrap_or_default())
+            });
+            format!("{}/creak", xdg_state)
+        }
+    };
     fs::create_dir_all(&dir)?;
-    Ok((format!("{}/stack.json", dir), format!("{}/stack.lock", dir)))
+    Ok(StatePaths {
+        state_path: format!("{}/stack.json", dir),
+        lock_path: format!("{}/stack.lock", dir),
+    })
 }
 
 fn lock_state(lock_path: &str) -> Result<fs::File> {
@@ -909,12 +1119,114 @@ fn save_state(path: &str, state: &StackState) -> Result<()> {
     Ok(())
 }
 
-fn reserve_stack_slot(position: Position, height: i32, gap: i32, timeout_ms: u64) -> Result<(i32, StackGuard)> {
-    let (state_path, lock_path) = state_paths()?;
-    let _lock = lock_state(&lock_path)?;
-    let mut state = load_state(&state_path)?;
+fn message_summary(message: &str) -> String {
+    let mut summary = message
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if summary.len() > 120 {
+        summary.truncate(120);
+    }
+    summary
+}
+
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let code = std::io::Error::last_os_error().raw_os_error();
+    code == Some(libc::EPERM)
+}
+
+fn prune_entries(state: &mut StackState, now: u64) {
+    state.entries.retain(|entry| {
+        let not_expired = entry.expires_at == 0 || entry.expires_at > now;
+        not_expired && process_alive(entry.pid)
+    });
+}
+
+fn list_active_entries(paths: &StatePaths) -> Result<Vec<StackEntry>> {
+    let _lock = lock_state(&paths.lock_path)?;
+    let mut state = load_state(&paths.state_path)?;
     let now = now_millis();
-    state.entries.retain(|entry| entry.expires_at == 0 || entry.expires_at > now);
+    let before = state.entries.len();
+    prune_entries(&mut state, now);
+    if state.entries.len() != before {
+        save_state(&paths.state_path, &state)?;
+    }
+    Ok(state.entries)
+}
+
+enum ClearSelector {
+    Id(u64),
+    Name(String),
+    Class(String),
+}
+
+fn clear_matches(entry: &StackEntry, selector: &ClearSelector) -> bool {
+    match selector {
+        ClearSelector::Id(id) => entry.id == *id,
+        ClearSelector::Name(name) => entry.name.as_deref() == Some(name.as_str()),
+        ClearSelector::Class(class) => entry.class.as_deref() == Some(class.as_str()),
+    }
+}
+
+fn send_sigterm(pid: u32) -> Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let code = std::io::Error::last_os_error().raw_os_error();
+    if code == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(anyhow!("failed to SIGTERM pid {}: {:?}", pid, code))
+}
+
+fn clear_active_entries(paths: &StatePaths, selector: ClearSelector) -> Result<usize> {
+    let _lock = lock_state(&paths.lock_path)?;
+    let mut state = load_state(&paths.state_path)?;
+    let now = now_millis();
+    prune_entries(&mut state, now);
+
+    let mut removed = 0usize;
+    let mut keep = Vec::with_capacity(state.entries.len());
+    for entry in state.entries.into_iter() {
+        if clear_matches(&entry, &selector) {
+            send_sigterm(entry.pid)?;
+            removed += 1;
+            continue;
+        }
+        keep.push(entry);
+    }
+    state.entries = keep;
+    save_state(&paths.state_path, &state)?;
+    Ok(removed)
+}
+
+fn reserve_stack_slot(
+    paths: &StatePaths,
+    position: Position,
+    height: i32,
+    gap: i32,
+    timeout_ms: u64,
+    name: Option<String>,
+    class: Option<String>,
+    summary: String,
+) -> Result<(i32, StackGuard)> {
+    let _lock = lock_state(&paths.lock_path)?;
+    let mut state = load_state(&paths.state_path)?;
+    let now = now_millis();
+    prune_entries(&mut state, now);
 
     let key = position_key(position);
     let mut offset = 0;
@@ -931,16 +1243,21 @@ fn reserve_stack_slot(position: Position, height: i32, gap: i32, timeout_ms: u64
         height,
         gap,
         expires_at,
+        created_at: now,
+        pid: std::process::id(),
+        name,
+        class,
+        summary,
     });
-    save_state(&state_path, &state)?;
+    save_state(&paths.state_path, &state)?;
 
     Ok((
         offset,
         StackGuard {
             id,
             position: key.to_string(),
-            state_path,
-            lock_path,
+            state_path: paths.state_path.clone(),
+            lock_path: paths.lock_path.clone(),
         },
     ))
 }
@@ -1049,7 +1366,12 @@ fn draw_notification(
     let h = logical_height as f64 - border;
 
     rounded_rect(&cr, x, y, w, h, radius);
-    cr.set_source_rgba(cfg.background[0], cfg.background[1], cfg.background[2], cfg.background[3]);
+    cr.set_source_rgba(
+        cfg.background[0],
+        cfg.background[1],
+        cfg.background[2],
+        cfg.background[3],
+    );
     cr.fill_preserve()?;
 
     if cfg.border_size > 0 {
@@ -1119,9 +1441,167 @@ fn draw_notification(
 fn rounded_rect(cr: &CairoContext, x: f64, y: f64, w: f64, h: f64, r: f64) {
     let r = r.min(w / 2.0).min(h / 2.0);
     cr.new_sub_path();
-    cr.arc(x + w - r, y + r, r, -90.0_f64.to_radians(), 0.0_f64.to_radians());
-    cr.arc(x + w - r, y + h - r, r, 0.0_f64.to_radians(), 90.0_f64.to_radians());
-    cr.arc(x + r, y + h - r, r, 90.0_f64.to_radians(), 180.0_f64.to_radians());
-    cr.arc(x + r, y + r, r, 180.0_f64.to_radians(), 270.0_f64.to_radians());
+    cr.arc(
+        x + w - r,
+        y + r,
+        r,
+        -90.0_f64.to_radians(),
+        0.0_f64.to_radians(),
+    );
+    cr.arc(
+        x + w - r,
+        y + h - r,
+        r,
+        0.0_f64.to_radians(),
+        90.0_f64.to_radians(),
+    );
+    cr.arc(
+        x + r,
+        y + h - r,
+        r,
+        90.0_f64.to_radians(),
+        180.0_f64.to_radians(),
+    );
+    cr.arc(
+        x + r,
+        y + r,
+        r,
+        180.0_f64.to_radians(),
+        270.0_f64.to_radians(),
+    );
     cr.close_path();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn make_temp_state_dir() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let seq = TEST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let uniq = format!("creak-test-{}-{}-{}", std::process::id(), nanos, seq);
+        let dir = env::temp_dir().join(uniq);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir.to_string_lossy().into_owned()
+    }
+
+    fn test_paths() -> StatePaths {
+        let dir = make_temp_state_dir();
+        state_paths(Some(&dir)).expect("state paths")
+    }
+
+    #[test]
+    fn parse_list_active_command() {
+        let tokens = vec![
+            "list".to_string(),
+            "active".to_string(),
+            "--state-dir".to_string(),
+            "/tmp/creak-test".to_string(),
+        ];
+        let (args, _) = parse_tokens(tokens, default_config()).expect("parse tokens");
+        match args.command {
+            Command::ListActive => {}
+            _ => panic!("expected list active command"),
+        }
+        assert_eq!(args.state_dir.as_deref(), Some("/tmp/creak-test"));
+    }
+
+    #[test]
+    fn clear_by_name_removes_matching_entries() {
+        let paths = test_paths();
+        let state = StackState {
+            next_id: 3,
+            entries: vec![
+                StackEntry {
+                    id: 1,
+                    position: "top".to_string(),
+                    height: 10,
+                    gap: 2,
+                    expires_at: now_millis() + 60_000,
+                    created_at: now_millis(),
+                    pid: 0,
+                    name: Some("water".to_string()),
+                    class: Some("reminder".to_string()),
+                    summary: "hydrate".to_string(),
+                },
+                StackEntry {
+                    id: 2,
+                    position: "top".to_string(),
+                    height: 10,
+                    gap: 2,
+                    expires_at: now_millis() + 60_000,
+                    created_at: now_millis(),
+                    pid: 0,
+                    name: Some("other".to_string()),
+                    class: Some("reminder".to_string()),
+                    summary: "other".to_string(),
+                },
+            ],
+        };
+        save_state(&paths.state_path, &state).expect("save");
+
+        let removed =
+            clear_active_entries(&paths, ClearSelector::Name("water".to_string())).expect("clear");
+        assert_eq!(removed, 1);
+        let updated = load_state(&paths.state_path).expect("reload");
+        assert_eq!(updated.entries.len(), 1);
+        assert_eq!(updated.entries[0].id, 2);
+    }
+
+    #[test]
+    fn list_active_prunes_expired_and_dead_entries() {
+        let paths = test_paths();
+        let now = now_millis();
+        let state = StackState {
+            next_id: 4,
+            entries: vec![
+                StackEntry {
+                    id: 1,
+                    position: "top".to_string(),
+                    height: 10,
+                    gap: 2,
+                    expires_at: now + 60_000,
+                    created_at: now,
+                    pid: 0,
+                    name: Some("alive".to_string()),
+                    class: Some("class".to_string()),
+                    summary: "alive".to_string(),
+                },
+                StackEntry {
+                    id: 2,
+                    position: "top".to_string(),
+                    height: 10,
+                    gap: 2,
+                    expires_at: now.saturating_sub(1),
+                    created_at: now,
+                    pid: 0,
+                    name: Some("expired".to_string()),
+                    class: Some("class".to_string()),
+                    summary: "expired".to_string(),
+                },
+                StackEntry {
+                    id: 3,
+                    position: "top".to_string(),
+                    height: 10,
+                    gap: 2,
+                    expires_at: now + 60_000,
+                    created_at: now,
+                    pid: 999_999,
+                    name: Some("dead-pid".to_string()),
+                    class: Some("class".to_string()),
+                    summary: "dead".to_string(),
+                },
+            ],
+        };
+        save_state(&paths.state_path, &state).expect("save");
+
+        let entries = list_active_entries(&paths).expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 1);
+    }
 }
