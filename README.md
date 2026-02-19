@@ -13,11 +13,11 @@ Binary output: ./target/release/creak
 ## Usage
 
 ```
-creak list active [--state-dir path]
-creak clear by name <name> [--state-dir path]
-creak clear by class <class> [--state-dir path]
-creak clear by id <id> [--state-dir path]
-creak [--state-dir path] [--name id] [--class class] [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] [--scale n] [--text-antialias default|none|gray|subpixel] [--text-hint default|none|slight|medium|full] [--text-hint-metrics default|on|off] <title> [body...]
+creak list active [--style name|path] [--state-dir path]
+creak clear by name <name> [--style name|path] [--state-dir path]
+creak clear by class <class> [--style name|path] [--state-dir path]
+creak clear by id <id> [--style name|path] [--state-dir path]
+creak [--style name|path] [--state-dir path] [--name id] [--class class] [--top-left|--top|--top-right|--left|--center|--right|--bottom-left|--bottom|--bottom-right] [--timeout ms] [--width px] [--font font] [--padding px] [--border-size px] [--border-radius px] [--background #RRGGBB[AA]] [--text #RRGGBB[AA]] [--border #RRGGBB[AA]] [--edge px] [--default-offset px] [--stack-gap px] [--stack|--no-stack] [--scale n] [--text-antialias default|none|gray|subpixel] [--text-hint default|none|slight|medium|full] [--text-hint-metrics default|on|off] <title> [body...]
 ```
 
 Examples:
@@ -30,6 +30,8 @@ creak --timeout 2000 "short"
 creak --width 420 "wide"
 creak --background "#00ff00" --text "#000000" "green"
 creak --name water --class reminder "drink water"
+creak --style hi "styled alert"
+creak --style /tmp/my-creak-config "custom path config"
 creak list active
 creak clear by name water
 ```
@@ -39,6 +41,10 @@ creak clear by name water
 Config file: `$XDG_CONFIG_HOME/creak/config`
 
 The config file is a list of default CLI options (same style as ripgrep). Each line is parsed like shell args; blank lines and lines starting with `#` are ignored.
+
+You can select a different config file with `--style`:
+- `--style hi` loads `$XDG_CONFIG_HOME/creak/hi`
+- `--style /path/to/file` loads that file directly
 
 Example config:
 
