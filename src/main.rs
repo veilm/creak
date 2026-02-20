@@ -158,7 +158,7 @@ Alert options:
   --top-left | --top | --top-right
   --left | --center | --right
   --bottom-left | --bottom | --bottom-right
-  --timeout <ms>
+  --timeout <ms>             0 means no auto-dismiss
   --width <px>
   --font <font>
   --padding <px>
@@ -524,7 +524,7 @@ fn run_alert(args: AlertArgs, cfg: &mut Config, state_paths: &StatePaths) -> Res
     let (position, base_margins) = position_to_anchor(cfg, args.position);
     let mut stack_offset = 0;
     let mut stack_guard: Option<StackGuard> = None;
-    if cfg.stack && cfg.timeout_ms > 0 {
+    if cfg.stack {
         if let Ok((offset, guard)) = reserve_stack_slot(
             state_paths,
             args.position,
@@ -585,10 +585,18 @@ fn run_alert(args: AlertArgs, cfg: &mut Config, state_paths: &StatePaths) -> Res
     surface.commit();
     conn.flush()?;
 
-    let deadline = Instant::now() + Duration::from_millis(cfg.timeout_ms);
+    let forever = cfg.timeout_ms == 0;
+    let deadline = if forever {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(cfg.timeout_ms))
+    };
     let mut last_check = Instant::now();
     let mut last_offset = stack_offset;
-    while Instant::now() < deadline && !state.closed && !SHOULD_CLOSE.load(Ordering::Relaxed) {
+    while !state.closed
+        && !SHOULD_CLOSE.load(Ordering::Relaxed)
+        && deadline.map(|d| Instant::now() < d).unwrap_or(true)
+    {
         dispatch_with_timeout(&mut event_queue, &mut state, 10)?;
         conn.flush()?;
         if let Some(guard) = stack_guard.as_ref() {
@@ -1320,7 +1328,11 @@ fn reserve_stack_slot(
 
     let id = state.next_id;
     state.next_id += 1;
-    let expires_at = now.saturating_add(timeout_ms);
+    let expires_at = if timeout_ms == 0 {
+        0
+    } else {
+        now.saturating_add(timeout_ms)
+    };
     state.entries.push(StackEntry {
         id,
         position: key.to_string(),
@@ -1718,5 +1730,25 @@ mod tests {
         let entries = list_active_entries(&paths).expect("list");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, 1);
+    }
+
+    #[test]
+    fn reserve_stack_slot_timeout_zero_is_non_expiring() {
+        let paths = test_paths();
+        let (_offset, _guard) = reserve_stack_slot(
+            &paths,
+            Position::Top,
+            24,
+            5,
+            0,
+            Some("forever".to_string()),
+            Some("test".to_string()),
+            "forever alert".to_string(),
+        )
+        .expect("reserve");
+
+        let state = load_state(&paths.state_path).expect("load state");
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].expires_at, 0);
     }
 }

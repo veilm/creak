@@ -27,6 +27,7 @@ creak "hi"
 creak --top-left "title" "body"
 creak --bottom "done"
 creak --timeout 2000 "short"
+creak --timeout 0 "stays until clicked or cleared"
 creak --width 420 "wide"
 creak --background "#00ff00" --text "#000000" "green"
 creak --name water --class reminder "drink water"
@@ -45,6 +46,7 @@ The config file is a list of default CLI options (same style as ripgrep). Each l
 You can select a different config file with `--style`:
 - `--style hi` loads `$XDG_CONFIG_HOME/creak/hi`
 - `--style /path/to/file` loads that file directly
+- `--timeout 0` disables auto-dismiss (alert stays until click or `creak clear ...`)
 
 Example config:
 
