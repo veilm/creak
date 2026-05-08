@@ -1382,13 +1382,17 @@ fn measure_text(cfg: &Config, text: &str) -> Result<(i32, i32)> {
 
     let font_desc = pango::FontDescription::from_string(&cfg.font);
     layout.set_font_description(Some(&font_desc));
-    layout.set_width(cfg.width * pango::SCALE);
+    layout.set_width(text_layout_width(cfg.width, cfg) * pango::SCALE);
     layout.set_alignment(pango::Alignment::Center);
     layout.set_wrap(pango::WrapMode::WordChar);
 
     let (text_width, text_height) = layout.pixel_size();
     let height = text_height + cfg.padding * 2 + cfg.border_size * 2;
     Ok((text_width, height))
+}
+
+fn text_layout_width(logical_width: i32, cfg: &Config) -> i32 {
+    (logical_width - 2 * (cfg.padding + cfg.border_size)).max(1)
 }
 
 struct Buffer {
@@ -1482,7 +1486,7 @@ fn draw_notification(
     layout.set_text(text);
     let font_desc = pango::FontDescription::from_string(&cfg.font);
     layout.set_font_description(Some(&font_desc));
-    layout.set_width((logical_width - 2 * (cfg.padding + cfg.border_size)) * pango::SCALE);
+    layout.set_width(text_layout_width(logical_width, cfg) * pango::SCALE);
     layout.set_alignment(pango::Alignment::Center);
     layout.set_wrap(pango::WrapMode::WordChar);
 
@@ -1619,6 +1623,46 @@ mod tests {
         let (style, rest) = extract_style_arg(tokens).expect("extract style");
         assert_eq!(style.as_deref(), Some("hi"));
         assert_eq!(rest, vec!["--timeout", "10", "hello"]);
+    }
+
+    #[test]
+    fn multiple_positional_args_become_title_plus_single_body_line() {
+        let tokens = vec![
+            "foo bar baz".to_string(),
+            "ban".to_string(),
+            "bal".to_string(),
+        ];
+        let (args, _) = parse_tokens(tokens, default_config()).expect("parse tokens");
+        match args.command {
+            Command::Show(alert) => {
+                assert_eq!(alert.message, "foo bar baz\nban bal");
+            }
+            _ => panic!("expected show command"),
+        }
+    }
+
+    #[test]
+    fn text_layout_width_uses_inner_content_box() {
+        let cfg = Config {
+            font: "Sans 12".to_string(),
+            width: 450,
+            padding: 20,
+            border_size: 3,
+            border_radius: 0,
+            timeout_ms: 1000,
+            background: [0.0, 0.0, 0.0, 1.0],
+            text: [1.0, 1.0, 1.0, 1.0],
+            border: [1.0, 1.0, 1.0, 1.0],
+            edge: 20,
+            default_offset: 250,
+            stack_gap: 10,
+            stack: true,
+            output_scale: 1,
+            text_antialias: None,
+            text_hint: None,
+            text_hint_metrics: None,
+        };
+        assert_eq!(text_layout_width(cfg.width, &cfg), 404);
     }
 
     #[test]
