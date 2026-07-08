@@ -506,6 +506,9 @@ fn run_alert(args: AlertArgs, cfg: &mut Config, state_paths: &StatePaths) -> Res
         .context("bind zwlr_layer_shell_v1")?;
     state.seat = globals.bind(&qh, 1..=7, ()).ok();
 
+    let _outputs = bind_outputs(&globals, &qh);
+    event_queue.roundtrip(&mut state)?;
+
     let surface = compositor.create_surface(&qh, ());
     let layer_surface = layer_shell.get_layer_surface(
         &surface,
@@ -624,14 +627,42 @@ fn run_alert(args: AlertArgs, cfg: &mut Config, state_paths: &StatePaths) -> Res
     Ok(())
 }
 
+fn bind_outputs<State>(
+    globals: &wayland_client::globals::GlobalList,
+    qh: &QueueHandle<State>,
+) -> Vec<WlOutput>
+where
+    State: Dispatch<WlOutput, ()> + 'static,
+{
+    globals.contents().with_list(|list| {
+        list.iter()
+            .filter(|global| global.interface == WlOutput::interface().name)
+            .map(|global| {
+                globals.registry().bind(
+                    global.name,
+                    global.version.min(WlOutput::interface().version),
+                    qh,
+                    (),
+                )
+            })
+            .collect()
+    })
+}
+
 unsafe extern "C" fn handle_signal(_: i32) {
     SHOULD_CLOSE.store(true, Ordering::Relaxed);
 }
 
 fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGTERM, handle_signal as libc::sighandler_t);
-        libc::signal(libc::SIGINT, handle_signal as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 
